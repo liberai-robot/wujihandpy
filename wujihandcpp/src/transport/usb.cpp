@@ -91,13 +91,16 @@ public:
         std::ignore = buffer.release();
     }
 
-    void receive(std::function<void(const std::byte*, size_t size)> callback) override {
+    void receive(
+        std::function<void(const std::byte*, size_t size)> callback,
+        std::function<void()> on_disconnect = nullptr) override {
         if (!callback)
             throw std::invalid_argument{"Callback function cannot be null"};
         if (receive_callback_)
             throw std::logic_error{"Receive function can only be called once"};
 
         receive_callback_ = std::move(callback);
+        on_disconnect_callback_ = std::move(on_disconnect);
         init_receive_transfers();
     };
 
@@ -394,17 +397,15 @@ private:
         int ret = libusb_submit_transfer(transfer);
         if (ret != 0) [[unlikely]] {
             if (ret == LIBUSB_ERROR_NO_DEVICE)
-                logger_.error(
-                    "Failed to re-submit receive transfer: Device disconnected. "
-                    "Terminating...");
+                logger_.error("Failed to re-submit receive transfer: Device disconnected.");
             else
                 logger_.error(
-                    "Failed to re-submit receive transfer: {} ({}). Terminating...", ret,
-                    libusb_errname(ret));
+                    "Failed to re-submit receive transfer: {} ({}).", ret, libusb_errname(ret));
             destroy_libusb_transfer(transfer);
 
-            // TODO: Replace abrupt termination with a flag and exception-based error handling
-            std::terminate();
+            if (on_disconnect_callback_)
+                on_disconnect_callback_();
+            return;
         }
     }
 
@@ -464,6 +465,7 @@ private:
     std::mutex transmit_transfer_pop_mutex_, transmit_transfer_push_mutex_;
 
     std::function<void(const std::byte*, size_t size)> receive_callback_;
+    std::function<void()> on_disconnect_callback_;
 };
 
 std::unique_ptr<ITransport>

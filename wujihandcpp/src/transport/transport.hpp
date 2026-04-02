@@ -25,7 +25,9 @@ public:
 
     virtual void transmit(std::unique_ptr<IBuffer> buffer, size_t size) = 0;
 
-    virtual void receive(std::function<void(const std::byte* buffer, size_t size)> callback) = 0;
+    virtual void receive(
+        std::function<void(const std::byte* buffer, size_t size)> callback,
+        std::function<void()> on_disconnect = nullptr) = 0;
 };
 
 std::unique_ptr<ITransport>

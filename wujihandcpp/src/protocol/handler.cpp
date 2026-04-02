@@ -53,9 +53,11 @@ public:
     }
 
     void start_transmit_receive() {
-        transport_->receive([this](const std::byte* buffer, size_t size) {
-            receive_transfer_completed_callback(buffer, size);
-        });
+        transport_->receive(
+            [this](const std::byte* buffer, size_t size) {
+                receive_transfer_completed_callback(buffer, size);
+            },
+            [this]() { disconnected_.store(true, std::memory_order::release); });
 
         sdo_thread_ = std::jthread{
             [this](const std::stop_token& stop_token) { sdo_thread_main(stop_token); }};
@@ -79,6 +81,9 @@ public:
         int storage_id, std::chrono::steady_clock::duration::rep timeout,
         void (*callback)(Buffer8 context, bool success), Buffer8 callback_context) {
         operation_thread_check();
+
+        if (disconnected_.load(std::memory_order::acquire))
+            throw device::DeviceDisconnectedError("Device is disconnected");
 
         if (storage_[storage_id].operation.load(std::memory_order::relaxed).mode
             != Operation::Mode::NONE) [[unlikely]]
@@ -113,6 +118,9 @@ public:
         Buffer8 data, int storage_id, std::chrono::steady_clock::duration::rep timeout,
         void (*callback)(Buffer8 context, bool success), Buffer8 callback_context) {
         operation_thread_check();
+
+        if (disconnected_.load(std::memory_order::acquire))
+            throw device::DeviceDisconnectedError("Device is disconnected");
 
         if (storage_[storage_id].operation.load(std::memory_order::relaxed).mode
             != Operation::Mode::NONE) [[unlikely]]
@@ -213,6 +221,9 @@ public:
         uint16_t index, uint8_t sub_index, std::chrono::steady_clock::duration timeout) {
         operation_thread_check();
 
+        if (disconnected_.load(std::memory_order::acquire))
+            throw device::DeviceDisconnectedError("Device is disconnected");
+
         // Find an available slot
         RawSdoUnit* unit = nullptr;
         for (auto& u : raw_sdo_units_) {
@@ -253,9 +264,12 @@ public:
             unit->mode = RawSdoUnit::Mode::NONE;
             unit->in_use.store(false, std::memory_order_release);
 
-            if (state == RawSdoUnit::State::FAILED)
+            if (state == RawSdoUnit::State::FAILED) {
+                if (disconnected_.load(std::memory_order::acquire))
+                    throw device::DeviceDisconnectedError("Device disconnected during SDO read");
                 throw device::TimeoutError(std::format(
                     "Raw SDO read timed out: index=0x{:04X}, sub_index={}", index, sub_index));
+            }
         }
 
         return result;
@@ -264,6 +278,8 @@ public:
     void raw_sdo_write(
         uint16_t index, uint8_t sub_index, const void* data, size_t size,
         std::chrono::steady_clock::duration timeout) {
+        if (disconnected_.load(std::memory_order::acquire))
+            throw device::DeviceDisconnectedError("Device is disconnected");
         operation_thread_check();
 
         if (size != 1 && size != 2 && size != 4 && size != 8)
@@ -308,9 +324,12 @@ public:
             unit->mode = RawSdoUnit::Mode::NONE;
             unit->in_use.store(false, std::memory_order_release);
 
-            if (state == RawSdoUnit::State::FAILED)
+            if (state == RawSdoUnit::State::FAILED) {
+                if (disconnected_.load(std::memory_order::acquire))
+                    throw device::DeviceDisconnectedError("Device disconnected during SDO write");
                 throw device::TimeoutError(std::format(
                     "Raw SDO write timed out: index=0x{:04X}, sub_index={}", index, sub_index));
+            }
         }
     }
 
@@ -648,6 +667,35 @@ private:
                 std::chrono::duration<double>(1.0 / update_rate));
 
         while (!stop_token.stop_requested()) {
+            if (disconnected_.load(std::memory_order::acquire)) {
+                // Fail all pending async operations
+                for (size_t i = 0; i < storage_unit_count_; i++) {
+                    auto& storage = storage_[i];
+                    auto operation = storage.operation.load(std::memory_order::acquire);
+                    if (operation.mode != Operation::Mode::NONE) {
+                        auto callback = storage.callback;
+                        auto context = storage.callback_context;
+                        operation.mode = Operation::Mode::NONE;
+                        storage.operation.store(operation, std::memory_order::release);
+                        if (callback)
+                            callback(context, false);
+                    }
+                }
+                // Wake up all blocked raw SDO operations
+                for (auto& unit : raw_sdo_units_) {
+                    if (!unit.in_use.load(std::memory_order_acquire))
+                        continue;
+                    std::lock_guard lock{unit.mutex};
+                    if (unit.state == RawSdoUnit::State::PENDING
+                        || unit.state == RawSdoUnit::State::READING
+                        || unit.state == RawSdoUnit::State::WRITING) {
+                        unit.state = RawSdoUnit::State::FAILED;
+                        unit.cv.notify_one();
+                    }
+                }
+                return;
+            }
+
             auto now = std::chrono::steady_clock::now();
 
             for (size_t i = 0; i < storage_unit_count_; i++) {
@@ -997,6 +1045,8 @@ private:
     static_assert(std::atomic<double>::is_always_lock_free);
     static_assert(std::atomic<uint32_t>::is_always_lock_free);
     static_assert(std::atomic<uint64_t>::is_always_lock_free);
+
+    std::atomic<bool> disconnected_ = false;
 
     std::unique_ptr<transport::ITransport> transport_;
     FrameBuilder sdo_builder_;
